@@ -1,141 +1,243 @@
 import { Service, PlatformAccessory, CharacteristicValue } from 'homebridge';
+import { Peripheral } from '@abandonware/noble';
+import pLimit from 'p-limit';
 
-import { ExampleHomebridgePlatform } from './platform';
+import { VeritableHomebridgePlatform } from './platform';
 
-/**
- * Platform Accessory
- * An instance of this class is created for each accessory your platform registers
- * Each accessory may expose multiple services of different service types.
- */
-export class ExamplePlatformAccessory {
-  private service: Service;
+export class VeritablePotagerAccessory {
+  private peripheral: Peripheral;
 
-  /**
-   * These are just used to create a working example
-   * You should implement your own code to track the state of your accessory
-   */
-  private exampleStates = {
-    On: false,
-    Brightness: 100,
+  private serviceLight: Service;
+  private sensorService: Service;
+
+  private limit = pLimit(1);
+
+  private state = {
+    On: true,
+    LightMode: 0,
+    HasWater: true,
   };
 
   constructor(
-    private readonly platform: ExampleHomebridgePlatform,
+    private readonly platform: VeritableHomebridgePlatform,
     private readonly accessory: PlatformAccessory,
+    private readonly p: Peripheral,
   ) {
 
-    // set accessory information
+    this.peripheral = p;
+
     this.accessory.getService(this.platform.Service.AccessoryInformation)!
-      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Default-Manufacturer')
-      .setCharacteristic(this.platform.Characteristic.Model, 'Default-Model')
-      .setCharacteristic(this.platform.Characteristic.SerialNumber, 'Default-Serial');
+      .setCharacteristic(this.platform.Characteristic.Manufacturer, 'Veritable Potager')
+      .setCharacteristic(this.platform.Characteristic.Model, 'Unknown')
+      .setCharacteristic(this.platform.Characteristic.SerialNumber, 'Unknown');
 
-    // get the LightBulb service if it exists, otherwise create a new LightBulb service
-    // you can create multiple services for each accessory
-    this.service = this.accessory.getService(this.platform.Service.Lightbulb) || this.accessory.addService(this.platform.Service.Lightbulb);
+    this.serviceLight = this.accessory.getService(this.platform.Service.Lightbulb) ||
+      this.accessory.addService(this.platform.Service.Lightbulb);
 
-    // set the service name, this is what is displayed as the default name on the Home app
-    // in this example we are using the name we stored in the `accessory.context` in the `discoverDevices` method.
-    this.service.setCharacteristic(this.platform.Characteristic.Name, accessory.context.device.exampleDisplayName);
+    this.serviceLight.setCharacteristic(this.platform.Characteristic.Name, this.peripheral.advertisement.localName);
 
-    // each service must implement at-minimum the "required characteristics" for the given service type
-    // see https://developers.homebridge.io/#/service/Lightbulb
+    this.serviceLight.getCharacteristic(this.platform.Characteristic.On)
+      .onSet(this.setOn.bind(this))
+      .onGet(this.getOn.bind(this));
 
-    // register handlers for the On/Off Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.On)
-      .onSet(this.setOn.bind(this))                // SET - bind to the `setOn` method below
-      .onGet(this.getOn.bind(this));               // GET - bind to the `getOn` method below
+    this.serviceLight.getCharacteristic(this.platform.Characteristic.Brightness)
+      .onSet(this.setBrightness.bind(this))
+      .onGet(this.getBrightness.bind(this));
 
-    // register handlers for the Brightness Characteristic
-    this.service.getCharacteristic(this.platform.Characteristic.Brightness)
-      .onSet(this.setBrightness.bind(this));       // SET - bind to the 'setBrightness` method below
+    this.sensorService = this.accessory.getService(this.platform.Service.ContactSensor) ||
+      this.accessory.addService(this.platform.Service.ContactSensor);
 
-    /**
-     * Creating multiple services of the same type.
-     *
-     * To avoid "Cannot add a Service with the same UUID another Service without also defining a unique 'subtype' property." error,
-     * when creating multiple services of the same type, you need to use the following syntax to specify a name and subtype id:
-     * this.accessory.getService('NAME') || this.accessory.addService(this.platform.Service.Lightbulb, 'NAME', 'USER_DEFINED_SUBTYPE_ID');
-     *
-     * The USER_DEFINED_SUBTYPE must be unique to the platform accessory (if you platform exposes multiple accessories, each accessory
-     * can use the same sub type id.)
-     */
+    this.sensorService.getCharacteristic(this.platform.Characteristic.ContactSensorState)
+      .onGet(this.getContactSensorState.bind(this));
 
-    // Example: add two "motion sensor" services to the accessory
-    const motionSensorOneService = this.accessory.getService('Motion Sensor One Name') ||
-      this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor One Name', 'YourUniqueIdentifier-1');
-
-    const motionSensorTwoService = this.accessory.getService('Motion Sensor Two Name') ||
-      this.accessory.addService(this.platform.Service.MotionSensor, 'Motion Sensor Two Name', 'YourUniqueIdentifier-2');
-
-    /**
-     * Updating characteristics values asynchronously.
-     *
-     * Example showing how to update the state of a Characteristic asynchronously instead
-     * of using the `on('get')` handlers.
-     * Here we change update the motion sensor trigger states on and off every 10 seconds
-     * the `updateCharacteristic` method.
-     *
-     */
-    let motionDetected = false;
+    this.limit(() => {
+      this.reload(true);
+    });
     setInterval(() => {
-      // EXAMPLE - inverse the trigger
-      motionDetected = !motionDetected;
-
-      // push the new value to HomeKit
-      motionSensorOneService.updateCharacteristic(this.platform.Characteristic.MotionDetected, motionDetected);
-      motionSensorTwoService.updateCharacteristic(this.platform.Characteristic.MotionDetected, !motionDetected);
-
-      this.platform.log.debug('Triggering motionSensorOneService:', motionDetected);
-      this.platform.log.debug('Triggering motionSensorTwoService:', !motionDetected);
-    }, 10000);
+      this.limit(() => {
+        this.reload();
+      });
+    }, 60000);
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, turning on a Light bulb.
-   */
+  async reload(firstStart = false) {
+    this.platform.log.debug('Current status ->', this.state);
+    const services = await this.peripheral.discoverServicesAsync([]);
+    const service = services.find((s) => s.uuid === 'fabca1ea9cc34640bb586d8be824421c');
+
+    const serviceCharacteristics = await service!.discoverCharacteristicsAsync([]);
+    const statusCharacteristic = serviceCharacteristics.find((c) => c.uuid === 'a0e46546c5154eb5987e61394f91b560');
+    const statusData: Buffer = await statusCharacteristic!.readAsync();
+    const statusInt = statusData.readUInt8();
+    const currentOn = (statusInt & 1) > 0;
+    const currentHasWater = (statusInt & 64) > 0;
+
+    if (firstStart || currentOn !== this.state.On) {
+      this.state.On = currentOn;
+      this.serviceLight.updateCharacteristic(this.platform.Characteristic.On, this.state.On);
+      if (!this.state.On) {
+        this.serviceLight.updateCharacteristic(this.platform.Characteristic.Brightness, 0);
+      }
+    }
+
+    if (firstStart || currentHasWater !== this.state.HasWater) {
+      this.state.HasWater = currentHasWater;
+      this.sensorService.updateCharacteristic(
+        this.platform.Characteristic.ContactSensorState,
+        this.state.HasWater ?
+          this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED :
+          this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED,
+      );
+    }
+
+    const configCharacteristic = serviceCharacteristics.find((c) => c.uuid === 'f65d72680bef46dc85d0f64ffb2296af');
+    const configData: Buffer = await configCharacteristic!.readAsync();
+    const configInt = configData.readUInt8();
+
+    const currentLightMode = (configInt & 63);
+    if (currentLightMode !== this.state.LightMode && this.state.On) {
+      this.state.LightMode = currentLightMode;
+      switch (this.state.LightMode) {
+        case 2:
+          this.serviceLight.updateCharacteristic(this.platform.Characteristic.Brightness, 100);
+          break;
+        case 1:
+          this.serviceLight.updateCharacteristic(this.platform.Characteristic.Brightness, 50);
+          break;
+      }
+    }
+
+    if (firstStart) {
+      // write validation key to device (this is an hardcoded password without any challenge)
+      const validationKeyCharacteristic = serviceCharacteristics.find((c) => c.uuid === 'f29e003d521e4388bc7c4de6741e8d04');
+      await validationKeyCharacteristic!.writeAsync(Buffer.from([100, 25, 4, 39]), false);
+
+      // get current date
+      const currentTimeService = services.find((s) => s.uuid === '1805');
+      const currentTimeCharacteristics = await currentTimeService!.discoverCharacteristicsAsync([]);
+      const currentTimeCharacteristic = currentTimeCharacteristics.find((c) => c.uuid === '2a2b');
+      const currentTimeData: Buffer = await currentTimeCharacteristic!.readAsync();
+      this.platform.log.debug(`Current time -> ${currentTimeData.toString('hex')}`);
+
+      const peripheralDate = new Date();
+      peripheralDate.setFullYear(currentTimeData.readUInt16LE(0), currentTimeData.readUInt8(2) - 1, currentTimeData.readUInt8(3));
+      peripheralDate.setHours(currentTimeData.readUInt8(4), currentTimeData.readUInt8(5), currentTimeData.readUInt8(6));
+
+      const now = new Date();
+      const nowBuffer = Buffer.alloc(10);
+      nowBuffer.writeUInt16LE(now.getFullYear(), 0);
+      nowBuffer.writeUInt8(now.getMonth() + 1, 2);
+      nowBuffer.writeUInt8(now.getDate(), 3);
+      nowBuffer.writeUInt8(now.getHours(), 4);
+      nowBuffer.writeUInt8(now.getMinutes(), 5);
+      nowBuffer.writeUInt8(now.getSeconds(), 6);
+
+      this.platform.log.debug(`New time -> ${nowBuffer.toString('hex')}`);
+      await currentTimeCharacteristic!.writeAsync(nowBuffer, false);
+    }
+
+    this.platform.log.debug('New status ->', this.state);
+  }
+
   async setOn(value: CharacteristicValue) {
-    // implement your own code to turn your device on/off
-    this.exampleStates.On = value as boolean;
+    const isOn = value as boolean;
 
-    this.platform.log.debug('Set Characteristic On ->', value);
+    this.platform.log.debug('Will Set Characteristic On ->', value);
+
+    await this.limit(async () => {
+      const services = await this.peripheral.discoverServicesAsync([]);
+      const service = services.find((s) => s.uuid === 'fabca1ea9cc34640bb586d8be824421c');
+      const serviceCharacteristics = await service!.discoverCharacteristicsAsync([]);
+      const configCharacteristic = serviceCharacteristics.find((c) => c.uuid === 'f65d72680bef46dc85d0f64ffb2296af');
+      const configData: Buffer = await configCharacteristic!.readAsync();
+      const configInt = configData.readUInt8();
+
+      const currentLightMode = (configInt & 63);
+
+      await configCharacteristic!.writeAsync(Buffer.from([currentLightMode + (isOn ? 64 : 128)]), false);
+
+      this.platform.log.debug('Set Characteristic On ->', value);
+
+      await this.reload();
+    });
   }
 
-  /**
-   * Handle the "GET" requests from HomeKit
-   * These are sent when HomeKit wants to know the current state of the accessory, for example, checking if a Light bulb is on.
-   *
-   * GET requests should return as fast as possbile. A long delay here will result in
-   * HomeKit being unresponsive and a bad user experience in general.
-   *
-   * If your device takes time to respond you should update the status of your device
-   * asynchronously instead using the `updateCharacteristic` method instead.
-
-   * @example
-   * this.service.updateCharacteristic(this.platform.Characteristic.On, true)
-   */
   async getOn(): Promise<CharacteristicValue> {
-    // implement your own code to check if the device is on
-    const isOn = this.exampleStates.On;
+    const isOn = this.state.On;
 
     this.platform.log.debug('Get Characteristic On ->', isOn);
 
-    // if you need to return an error to show the device as "Not Responding" in the Home app:
-    // throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    if (this.peripheral.state !== 'connected') {
+      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
 
     return isOn;
   }
 
-  /**
-   * Handle "SET" requests from HomeKit
-   * These are sent when the user changes the state of an accessory, for example, changing the Brightness
-   */
   async setBrightness(value: CharacteristicValue) {
-    // implement your own code to set the brightness
-    this.exampleStates.Brightness = value as number;
+    const v = value as number;
+    let currentLightMode = this.state.LightMode;
+    if (v > 50) {
+      currentLightMode = 2;
+    }
+    if (v <= 50) {
+      currentLightMode = 1;
+    }
+    if (v === 0) {
+      currentLightMode = 0;
+    }
 
-    this.platform.log.debug('Set Characteristic Brightness -> ', value);
+    this.platform.log.debug('Will Set Light Mode ->', currentLightMode);
+
+    await this.limit(async () => {
+      const services = await this.peripheral.discoverServicesAsync([]);
+      const service = services.find((s) => s.uuid === 'fabca1ea9cc34640bb586d8be824421c');
+      const serviceCharacteristics = await service!.discoverCharacteristicsAsync([]);
+      const configCharacteristic = serviceCharacteristics.find((c) => c.uuid === 'f65d72680bef46dc85d0f64ffb2296af');
+
+      await configCharacteristic!.writeAsync(Buffer.from([currentLightMode]), false);
+
+      this.platform.log.debug('Set Light Mode -> ', currentLightMode);
+
+      await this.reload();
+    });
+  }
+
+  async getBrightness(): Promise<CharacteristicValue> {
+    const brightness = this.state.LightMode;
+
+    this.platform.log.debug('Get Light Mode -> ', brightness);
+
+    if (this.peripheral.state !== 'connected') {
+      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+
+    if (!this.state.On) {
+      return 0;
+    }
+
+    switch (brightness) {
+      case 1:
+        return 50;
+      case 2:
+        return 100;
+    }
+
+    return 0;
+  }
+
+  async getContactSensorState(): Promise<CharacteristicValue> {
+    const hasWater = this.state.HasWater;
+
+    this.platform.log.debug('Get Contact Sensor State -> ', hasWater);
+
+    if (this.peripheral.state !== 'connected') {
+      throw new this.platform.api.hap.HapStatusError(this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+
+    return hasWater ?
+      this.platform.Characteristic.ContactSensorState.CONTACT_DETECTED :
+      this.platform.Characteristic.ContactSensorState.CONTACT_NOT_DETECTED;
   }
 
 }
